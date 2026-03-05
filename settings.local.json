@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(git add index.html game.js)",
-      "Bash(git commit:*)",
-      "mcp__Claude_Preview__preview_start"
-    ]
-  }
-}
