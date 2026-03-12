@@ -26,16 +26,22 @@ const STRESS_CALM_DRAIN = -0.25;
 const STRESS_STILL_DRAIN = -0.05;
 const MICRO_SPIKE_CHANCE = 0.003;
 const MICRO_SPIKE_AMOUNT = 8;
+const ZOOM_OUT_SCALE = 0.5;            // camera zooms to 50% (shows 2x more maze)
+const ZOOM_OUT_STRESS_RATE = 0.2;      // extra stress per frame while zoomed out
+const ZOOM_OUT_VISIBILITY_MULT = 2.0;  // fog circle radius multiplier while zoomed
 
 // ============================================================
 // GAME STATE
 // ============================================================
-let gameState = 'menu';
+let gameState = 'menu'; // menu, charSelect, instructions, playing, paused, episode, win, lose
 let selectedChar = 0;
 const characters = [
-  { name: 'Alex', color: '#4fc3f7', accent: '#0288d1' },
-  { name: 'Sam', color: '#ef5350', accent: '#c62828' },
-  { name: 'Jordan', color: '#66bb6a', accent: '#2e7d32' },
+  { name: 'Alex', color: '#4fc3f7', accent: '#0288d1',
+    speedMult: 1.3, stressMult: 1.4, trait: 'Fast but anxious' },
+  { name: 'Sam', color: '#ef5350', accent: '#c62828',
+    speedMult: 0.8, stressMult: 0.65, trait: 'Slow but calm' },
+  { name: 'Jordan', color: '#66bb6a', accent: '#2e7d32',
+    speedMult: 1.0, stressMult: 1.0, trait: 'Balanced' },
 ];
 
 let player = { x: 0, y: 0 };
@@ -53,6 +59,11 @@ let screenShake = { x: 0, y: 0 };
 let microSpikeActive = 0;
 let lastTime = 0;
 let dt = 0;
+let arrowAngle = 0; // current smoothed angle of the direction arrow
+let timeBoosts = []; // { r, c, collected }
+const TIME_BOOST_AMOUNT = 5; // seconds added per pickup
+let timeBoostFlash = 0; // frames remaining for the +5s flash
+let isZoomedOut = false;
 
 // p5.js fog buffer
 let fogBuffer;
@@ -190,6 +201,23 @@ function generateMaze() {
       }
     }
   }
+
+  // Time boost pickups (6-8 scattered)
+  timeBoosts = [];
+  const boostCount = 6 + Math.floor(Math.random() * 3);
+  for (let i = 0; i < boostCount; i++) {
+    let br, bc;
+    do {
+      br = Math.floor(Math.random() * MAZE_ROWS);
+      bc = Math.floor(Math.random() * MAZE_COLS);
+    } while (
+      (br === 0 && bc === 0) ||
+      (br === MAZE_ROWS - 1 && bc === MAZE_COLS - 1) ||
+      calmZones.some(cz => cz.r === br && cz.c === bc) ||
+      timeBoosts.some(tb => tb.r === br && tb.c === bc)
+    );
+    timeBoosts.push({ r: br, c: bc, collected: false });
+  }
 }
 
 // ============================================================
@@ -257,6 +285,8 @@ function keyPressed() {
     if (gameState === 'menu') {
       gameState = 'charSelect';
     } else if (gameState === 'charSelect') {
+      gameState = 'instructions';
+    } else if (gameState === 'instructions') {
       startGame();
     } else if (gameState === 'win' || gameState === 'lose') {
       gameState = 'menu';
@@ -352,7 +382,9 @@ function updatePlaying() {
   }
 
   const isRunning = keyIsDown(SHIFT);
-  let spd = isRunning ? RUN_SPEED : PLAYER_SPEED;
+  isZoomedOut = keyIsDown(90); // Z key
+  const ch = characters[selectedChar];
+  let spd = (isRunning ? RUN_SPEED : PLAYER_SPEED) * ch.speedMult;
   const isMoving = dx !== 0 || dy !== 0;
 
   if (gameState === 'episode') {
@@ -379,15 +411,17 @@ function updatePlaying() {
 
   // Stress
   if (gameState !== 'episode') {
-    stress += STRESS_PASSIVE_RATE * dt * 60;
-    if (isMoving && isRunning) stress += STRESS_RUN_RATE * dt * 60;
-    if (inNarrowZone) stress += STRESS_NARROW_RATE * dt * 60;
-    if (inScaryZone) stress += STRESS_SCARY_RATE * dt * 60;
+    const stressMult = ch.stressMult;
+    stress += STRESS_PASSIVE_RATE * dt * 60 * stressMult;
+    if (isMoving && isRunning) stress += STRESS_RUN_RATE * dt * 60 * stressMult;
+    if (inNarrowZone) stress += STRESS_NARROW_RATE * dt * 60 * stressMult;
+    if (inScaryZone) stress += STRESS_SCARY_RATE * dt * 60 * stressMult;
+    if (isZoomedOut) stress += ZOOM_OUT_STRESS_RATE * dt * 60 * stressMult;
     if (inCalmZone) stress += STRESS_CALM_DRAIN * dt * 60;
     if (!isMoving) stress += STRESS_STILL_DRAIN * dt * 60;
 
     if (Math.random() < MICRO_SPIKE_CHANCE) {
-      stress += MICRO_SPIKE_AMOUNT;
+      stress += MICRO_SPIKE_AMOUNT * stressMult;
       microSpikeActive = 15;
       playMicroSpikeSound();
     }
@@ -416,6 +450,19 @@ function updatePlaying() {
   }
 
   if (microSpikeActive > 0) microSpikeActive--;
+  if (timeBoostFlash > 0) timeBoostFlash--;
+
+  // Time boost collection
+  const { r: pr, c: pc } = getPlayerCell();
+  for (const tb of timeBoosts) {
+    if (!tb.collected && tb.r === pr && tb.c === pc) {
+      tb.collected = true;
+      timer += TIME_BOOST_AMOUNT;
+      timeBoostFlash = 60; // show +5s for 1 second
+      playTone(660, 0.15, 'sine', 0.2);
+      playTone(880, 0.15, 'sine', 0.15);
+    }
+  }
 
   // Win condition
   const distToEnd = dist(player.x, player.y, endPos.x, endPos.y);
@@ -435,6 +482,8 @@ function draw() {
     drawMenu();
   } else if (gameState === 'charSelect') {
     drawCharSelect();
+  } else if (gameState === 'instructions') {
+    drawInstructions();
   } else if (gameState === 'playing' || gameState === 'episode') {
     drawGameplay();
   } else if (gameState === 'paused') {
@@ -469,42 +518,42 @@ function drawMenu() {
   // Title
   textAlign(CENTER, CENTER);
   textStyle(BOLD);
-  textSize(52);
+  textSize(64);
   fill(224);
-  text('LOST CONTROL', cx, cy - 100);
+  text('LOST CONTROL', cx, cy - 120);
 
   // Subtitle
   textStyle(NORMAL);
-  textSize(18);
+  textSize(22);
   fill(136);
-  text('An Epilepsy Awareness Experience', cx, cy - 60);
+  text('An Epilepsy Awareness Experience', cx, cy - 65);
 
   // Flicker
   if (Math.random() < 0.05) {
     fill(255);
-    text('An Epilepsy Awareness Experience', cx, cy - 60);
+    text('An Epilepsy Awareness Experience', cx, cy - 65);
   }
 
   // Instructions
-  textSize(16);
+  textSize(20);
   fill(170);
   text("You are on a journey but terrified of what's to come.", cx, cy + 10);
-  text('Navigate the maze before time runs out.', cx, cy + 35);
-  text('But beware... you might lose control.', cx, cy + 60);
+  text('Navigate the maze before time runs out.', cx, cy + 40);
+  text('But beware... you might lose control.', cx, cy + 70);
 
   // Prompt
   const blink = sin(frameCount * 0.08) > 0;
   if (blink) {
     textStyle(BOLD);
-    textSize(22);
+    textSize(28);
     fill(255);
-    text('[ PRESS ENTER TO START ]', cx, cy + 130);
+    text('[ PRESS ENTER TO START ]', cx, cy + 140);
   }
 
   // Controls hint
   textStyle(NORMAL);
-  textSize(13);
-  fill(85);
+  textSize(16);
+  fill(100);
   text('WASD / Arrow Keys = Move  |  Shift = Run  |  P = Pause  |  R = Restart', cx, height - 30);
 }
 
@@ -519,14 +568,14 @@ function drawCharSelect() {
 
   textAlign(CENTER, CENTER);
   textStyle(BOLD);
-  textSize(36);
+  textSize(44);
   fill(224);
-  text('CHOOSE YOUR CHARACTER', cx, cy - 120);
+  text('CHOOSE YOUR CHARACTER', cx, cy - 130);
 
   textStyle(NORMAL);
-  textSize(14);
+  textSize(18);
   fill(136);
-  text('Use LEFT / RIGHT arrow keys to select, ENTER to confirm', cx, cy - 80);
+  text('Use LEFT / RIGHT arrow keys to select, ENTER to confirm', cx, cy - 85);
 
   const spacing = 160;
   const startX = cx - spacing;
@@ -541,7 +590,7 @@ function drawCharSelect() {
       noFill();
       stroke(255);
       strokeWeight(3);
-      rect(x - 45, y - 55, 90, 110);
+      rect(x - 55, y - 55, 110, 155);
 
       // Arrow indicators
       noStroke();
@@ -567,9 +616,134 @@ function drawCharSelect() {
 
     // Name
     textStyle(selected ? BOLD : NORMAL);
-    textSize(16);
+    textSize(20);
     fill(selected ? 255 : 136);
-    text(ch.name, x, y + 45);
+    text(ch.name, x, y + 48);
+
+    // Trait description
+    textStyle(NORMAL);
+    textSize(13);
+    fill(selected ? 200 : 120);
+    text(ch.trait, x, y + 68);
+
+    // Stats
+    textSize(11);
+    fill(selected ? 170 : 100);
+    const spdLabel = ch.speedMult > 1 ? `+${Math.round((ch.speedMult - 1) * 100)}%` : ch.speedMult < 1 ? `${Math.round((ch.speedMult - 1) * 100)}%` : '0%';
+    const strLabel = ch.stressMult > 1 ? `+${Math.round((ch.stressMult - 1) * 100)}%` : ch.stressMult < 1 ? `${Math.round((ch.stressMult - 1) * 100)}%` : '0%';
+    text(`SPD:${spdLabel}  STR:${strLabel}`, x, y + 85);
+  }
+}
+
+// ============================================================
+// INSTRUCTIONS SCREEN
+// ============================================================
+function drawInstructions() {
+  background(10);
+
+  const cx = width / 2;
+  const cy = height / 2;
+  const leftX = cx - 220;
+
+  // Title
+  textAlign(CENTER, CENTER);
+  textStyle(BOLD);
+  textSize(40);
+  fill(224);
+  text('HOW TO PLAY', cx, cy - 250);
+
+  // Divider line
+  stroke(60);
+  strokeWeight(1);
+  line(cx - 200, cy - 225, cx + 200, cy - 225);
+  noStroke();
+
+  // --- Objective ---
+  textAlign(LEFT, CENTER);
+  textStyle(BOLD);
+  textSize(20);
+  fill(0, 255, 120);
+  text('OBJECTIVE', leftX, cy - 195);
+
+  textStyle(NORMAL);
+  textSize(16);
+  fill(190);
+  text('Reach the green exit at the end of the maze', leftX, cy - 170);
+  text('before the 90-second timer runs out.', leftX, cy - 148);
+
+  // --- Movement ---
+  textStyle(BOLD);
+  textSize(20);
+  fill(100, 180, 255);
+  text('MOVEMENT', leftX, cy - 110);
+
+  textStyle(NORMAL);
+  textSize(16);
+  fill(190);
+  text('Arrow Keys / WASD to move', leftX, cy - 85);
+  text('Hold Shift to run (increases stress)', leftX, cy - 63);
+  text('A green arrow near you points toward the exit', leftX, cy - 41);
+  text('Press Z to zoom out (increases stress faster)', leftX, cy - 19);
+
+  // --- Zones ---
+  textStyle(BOLD);
+  textSize(20);
+  fill(255, 200, 100);
+  text('ZONES', leftX, cy + 19);
+
+  // Calm zone indicator
+  textStyle(NORMAL);
+  textSize(16);
+  fill(255, 200, 100);
+  circle(leftX + 8, cy + 44, 14);
+  fill(190);
+  text('Yellow glow = Calm Zone (reduces stress)', leftX + 22, cy + 44);
+
+  // Scary zone indicator
+  fill(200, 50, 50);
+  circle(leftX + 8, cy + 69, 14);
+  fill(190);
+  text('Red glow = Danger Zone (increases stress)', leftX + 22, cy + 69);
+
+  // Time boost indicator
+  fill(0, 200, 255);
+  circle(leftX + 8, cy + 94, 14);
+  fill(190);
+  text('Blue orb = Time Boost (+5 seconds)', leftX + 22, cy + 94);
+
+  // --- Stress & Episodes ---
+  textStyle(BOLD);
+  textSize(20);
+  fill(244, 67, 54);
+  text('STRESS & EPISODES', leftX, cy + 132);
+
+  textStyle(NORMAL);
+  textSize(16);
+  fill(190);
+  text('Stress rises over time, faster when running', leftX, cy + 157);
+  text('or in danger zones. At 100% stress, an episode', leftX, cy + 179);
+  text('triggers: controls invert and vision shrinks.', leftX, cy + 201);
+
+  // --- Timer ---
+  textStyle(BOLD);
+  textSize(20);
+  fill(224);
+  text('TIMER', leftX, cy + 239);
+
+  textStyle(NORMAL);
+  textSize(16);
+  fill(190);
+  text('You have 90 seconds. The timer is shown at the', leftX, cy + 264);
+  text('top of the screen. If it hits 0, you lose.', leftX, cy + 286);
+
+  // --- Start prompt ---
+  textAlign(CENTER, CENTER);
+  const blink = sin(frameCount * 0.08) > 0;
+  if (blink) {
+    textStyle(BOLD);
+    textSize(24);
+    fill(255);
+    text('[ PRESS ENTER TO BEGIN ]', cx, height - 40);
   }
 }
 
@@ -595,6 +769,13 @@ function drawGameplay() {
   if (microSpikeActive > 0) {
     camX += (Math.random() - 0.5) * 6;
     camY += (Math.random() - 0.5) * 6;
+  }
+
+  // Zoom out: scale world around screen center
+  if (isZoomedOut) {
+    translate(width / 2, height / 2);
+    scale(ZOOM_OUT_SCALE);
+    translate(-width / 2, -height / 2);
   }
 
   translate(-camX, -camY);
@@ -632,6 +813,37 @@ function drawGameplay() {
     noStroke();
     fill(80, 0, 0, a);
     rect(zx, zy, CELL_SIZE, CELL_SIZE);
+  }
+
+  // --- Time boost pickups ---
+  for (const tb of timeBoosts) {
+    if (tb.collected) continue;
+    const bx = tb.c * CELL_SIZE + CELL_SIZE / 2;
+    const by = tb.r * CELL_SIZE + CELL_SIZE / 2;
+    const pulse = sin(frameCount * 0.1) * 0.15 + 0.85;
+    const glowSize = 18 * pulse;
+
+    // Outer glow
+    noStroke();
+    fill(0, 180, 255, 30);
+    circle(bx, by, glowSize * 2.5);
+    fill(0, 180, 255, 50);
+    circle(bx, by, glowSize * 1.6);
+
+    // Core circle
+    fill(0, 200, 255, 200);
+    circle(bx, by, glowSize);
+
+    // Inner highlight
+    fill(255, 255, 255, 160);
+    circle(bx, by - 2, glowSize * 0.4);
+
+    // +5 label
+    fill(255, 255, 255, 180);
+    textAlign(CENTER, CENTER);
+    textStyle(BOLD);
+    textSize(10);
+    text('+5', bx, by + 1);
   }
 
   // --- End zone ---
@@ -682,6 +894,9 @@ function drawGameplay() {
   circle(player.x - 4, player.y - 3, 3);
   circle(player.x + 4, player.y - 3, 3);
 
+  // --- Direction arrow to exit ---
+  drawDirectionArrow();
+
   pop();
 
   // --- Fog of war ---
@@ -704,6 +919,54 @@ function drawGameplay() {
 }
 
 // ============================================================
+// DIRECTION ARROW TO EXIT
+// ============================================================
+function drawDirectionArrow() {
+  // Calculate target angle from player to exit
+  const targetAngle = atan2(endPos.y - player.y, endPos.x - player.x);
+
+  // Smoothly interpolate the arrow angle toward the target
+  let diff = targetAngle - arrowAngle;
+  // Normalize angle difference to [-PI, PI]
+  while (diff > PI) diff -= TWO_PI;
+  while (diff < -PI) diff += TWO_PI;
+  arrowAngle += diff * 0.1; // lerp factor for smooth rotation
+
+  // Arrow orbits at a fixed distance from the player
+  const orbitRadius = PLAYER_SIZE + 12;
+  const ax = player.x + cos(arrowAngle) * orbitRadius;
+  const ay = player.y + sin(arrowAngle) * orbitRadius;
+
+  // Gentle bobbing for a lively feel
+  const bob = sin(frameCount * 0.08) * 1.5;
+
+  // Draw the arrow
+  push();
+  translate(ax + cos(arrowAngle + HALF_PI) * bob, ay + sin(arrowAngle + HALF_PI) * bob);
+  rotate(arrowAngle);
+
+  // Arrow shape: a small triangle pointing right (in local coords)
+  const size = 8;
+  noStroke();
+  // Semi-transparent white with green tint to match exit color
+  fill(0, 255, 120, 180);
+  triangle(
+    size, 0,        // tip
+    -size, -size * 0.6,  // top-left
+    -size, size * 0.6    // bottom-left
+  );
+
+  // Small inner highlight
+  fill(255, 255, 255, 100);
+  triangle(
+    size * 0.5, 0,
+    -size * 0.3, -size * 0.25,
+    -size * 0.3, size * 0.25
+  );
+  pop();
+}
+
+// ============================================================
 // FOG OF WAR
 // ============================================================
 function drawFog() {
@@ -719,6 +982,8 @@ function drawFog() {
     visRadius = MIN_VISIBILITY_RADIUS * 0.8;
     visRadius += sin(frameCount * 0.2) * 10;
   }
+
+  if (isZoomedOut) visRadius *= ZOOM_OUT_VISIBILITY_MULT;
 
   // Use the underlying canvas context of the p5.Graphics buffer for gradient
   const fCtx = fogBuffer.drawingContext;
@@ -754,20 +1019,20 @@ function drawFog() {
 // ============================================================
 function drawHUD() {
   const padding = 20;
-  const barWidth = 300;
-  const barHeight = 20;
+  const barWidth = 340;
+  const barHeight = 24;
 
   // --- Stress meter ---
   const barX = (width - barWidth) / 2;
-  const barY = height - padding - barHeight - 10;
+  const barY = height - padding - barHeight - 14;
 
   // Label
   textAlign(CENTER, CENTER);
-  textStyle(NORMAL);
-  textSize(12);
+  textStyle(BOLD);
+  textSize(16);
   fill(170);
   noStroke();
-  text('STRESS', width / 2, barY - 10);
+  text('STRESS', width / 2, barY - 14);
 
   // Bar background
   fill(40, 40, 40, 200);
@@ -796,7 +1061,7 @@ function drawHUD() {
   // Stress percentage
   noStroke();
   textStyle(BOLD);
-  textSize(12);
+  textSize(14);
   fill(255);
   text(`${Math.floor(stress)}%`, width / 2, barY + barHeight / 2);
 
@@ -809,45 +1074,63 @@ function drawHUD() {
   if (timer < 15) {
     fill(sin(frameCount * 0.2) > 0 ? color(244, 67, 54) : color(255, 102, 89));
     textStyle(BOLD);
-    textSize(32);
+    textSize(42);
   } else if (timer < 30) {
     fill(255, 152, 0);
     textStyle(BOLD);
-    textSize(28);
+    textSize(36);
   } else {
     fill(224);
     textStyle(BOLD);
-    textSize(28);
+    textSize(36);
   }
-  text(timeStr, width / 2, padding + 20);
+  text(timeStr, width / 2, padding + 25);
+
+  // +5s flash when time boost collected
+  if (timeBoostFlash > 0) {
+    const flashAlpha = map(timeBoostFlash, 0, 60, 0, 255);
+    const flashY = padding + 55 - map(timeBoostFlash, 60, 0, 0, 15); // float upward
+    fill(0, 200, 255, flashAlpha);
+    textStyle(BOLD);
+    textSize(22);
+    text('+5s', width / 2, flashY);
+  }
 
   // --- Zone indicator ---
   const { r, c } = getPlayerCell();
   const inCalmZone = calmZones.some(cz => cz.r === r && cz.c === c);
   if (inCalmZone) {
     textStyle(NORMAL);
-    textSize(14);
-    fill(255, 200, 100, 180);
-    text('~ Calm Zone ~', width / 2, padding + 50);
+    textSize(18);
+    fill(255, 200, 100, 200);
+    text('~ Calm Zone ~', width / 2, padding + 60);
   }
   const inScaryZone = scaryZones.some(sz => sz.r === r && sz.c === c);
   if (inScaryZone) {
     textStyle(NORMAL);
-    textSize(14);
-    fill(200, 50, 50, 180);
-    text('! Danger Zone !', width / 2, padding + 50);
+    textSize(18);
+    fill(200, 50, 50, 200);
+    text('! Danger Zone !', width / 2, padding + 60);
+  }
+
+  // Zoom out indicator
+  if (isZoomedOut) {
+    textStyle(BOLD);
+    textSize(18);
+    fill(255, 170, 0, 200);
+    text('ZOOMED OUT (Stress +)', width / 2, padding + 80);
   }
 
   // --- Episode warning ---
   if (gameState === 'episode') {
     if (sin(frameCount * 0.2) > 0) {
       textStyle(BOLD);
-      textSize(20);
+      textSize(26);
       fill(255, 23, 68);
-      text('!! EPISODE !!', width / 2, height / 2 - 60);
+      text('!! EPISODE !!', width / 2, height / 2 - 65);
     }
     textStyle(NORMAL);
-    textSize(13);
+    textSize(16);
     fill(204);
     text('Controls inverted - Stop moving or find a calm zone', width / 2, height / 2 - 35);
   }
@@ -855,9 +1138,9 @@ function drawHUD() {
   // --- Controls reminder ---
   textAlign(LEFT, CENTER);
   textStyle(NORMAL);
-  textSize(11);
-  fill(150, 150, 150, 128);
-  text('P = Pause | R = Restart | Shift = Run', padding, padding + 10);
+  textSize(14);
+  fill(150, 150, 150, 150);
+  text('P = Pause | R = Restart | Shift = Run | Z = Zoom Out', padding, padding + 12);
 }
 
 // ============================================================
@@ -894,14 +1177,14 @@ function drawPauseOverlay() {
 
   textAlign(CENTER, CENTER);
   textStyle(BOLD);
-  textSize(48);
+  textSize(58);
   fill(224);
   text('PAUSED', width / 2, height / 2 - 20);
 
   textStyle(NORMAL);
-  textSize(16);
+  textSize(20);
   fill(170);
-  text('Press P to resume | R to restart', width / 2, height / 2 + 30);
+  text('Press P to resume | R to restart', width / 2, height / 2 + 35);
 }
 
 // ============================================================
@@ -927,20 +1210,20 @@ function drawWinScreen() {
 
   textAlign(CENTER, CENTER);
   textStyle(BOLD);
-  textSize(52);
+  textSize(62);
   fill(76, 175, 80);
   text('YOU MADE IT', cx, cy - 50);
 
   const timeLeft = Math.floor(timer);
   textStyle(NORMAL);
-  textSize(18);
+  textSize(22);
   fill(170);
-  text(`You reached the end with ${timeLeft} seconds to spare.`, cx, cy + 10);
-  text('You kept control through the chaos.', cx, cy + 40);
+  text(`You reached the end with ${timeLeft} seconds to spare.`, cx, cy + 15);
+  text('You kept control through the chaos.', cx, cy + 48);
 
-  textSize(14);
+  textSize(18);
   fill(102);
-  text('Press ENTER to return to menu | R to play again', cx, cy + 100);
+  text('Press ENTER to return to menu | R to play again', cx, cy + 110);
 }
 
 // ============================================================
@@ -954,7 +1237,7 @@ function drawLoseScreen() {
 
   textAlign(CENTER, CENTER);
   textStyle(BOLD);
-  textSize(52);
+  textSize(62);
   fill(244, 67, 54);
 
   // Glitch effect
@@ -966,12 +1249,12 @@ function drawLoseScreen() {
   }
 
   textStyle(NORMAL);
-  textSize(18);
+  textSize(22);
   fill(170);
-  text("You couldn't make it through in time.", cx, cy + 10);
-  text('The maze consumed you.', cx, cy + 40);
+  text("You couldn't make it through in time.", cx, cy + 15);
+  text('The maze consumed you.', cx, cy + 48);
 
-  textSize(14);
+  textSize(18);
   fill(102);
-  text('Press ENTER to return to menu | R to try again', cx, cy + 100);
+  text('Press ENTER to return to menu | R to try again', cx, cy + 110);
 }
