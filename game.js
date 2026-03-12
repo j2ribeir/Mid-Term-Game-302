@@ -29,6 +29,8 @@ const MICRO_SPIKE_AMOUNT = 8;
 const ZOOM_OUT_SCALE = 0.5;            // camera zooms to 50% (shows 2x more maze)
 const ZOOM_OUT_STRESS_RATE = 0.2;      // extra stress per frame while zoomed out
 const ZOOM_OUT_VISIBILITY_MULT = 2.0;  // fog circle radius multiplier while zoomed
+const WALL_THICKNESS = 6;              // px for textured walls
+const MORTAR_WIDTH = 2;                // gap between bricks
 
 // ============================================================
 // GAME STATE
@@ -36,12 +38,15 @@ const ZOOM_OUT_VISIBILITY_MULT = 2.0;  // fog circle radius multiplier while zoo
 let gameState = 'menu'; // menu, charSelect, instructions, playing, paused, episode, win, lose
 let selectedChar = 0;
 const characters = [
-  { name: 'Alex', color: '#4fc3f7', accent: '#0288d1',
-    speedMult: 1.3, stressMult: 1.4, trait: 'Fast but anxious' },
-  { name: 'Sam', color: '#ef5350', accent: '#c62828',
-    speedMult: 0.8, stressMult: 0.65, trait: 'Slow but calm' },
-  { name: 'Jordan', color: '#66bb6a', accent: '#2e7d32',
-    speedMult: 1.0, stressMult: 1.0, trait: 'Balanced' },
+  { name: 'Knight', color: '#8a9bb2', accent: '#5a6880',
+    speedMult: 1.3, stressMult: 1.4, trait: 'Fast but anxious',
+    spdDesc: 'Moves 30% faster', strDesc: 'Stress rises 40% faster' },
+  { name: 'Mage', color: '#8b6b4a', accent: '#5c4530',
+    speedMult: 0.8, stressMult: 0.65, trait: 'Slow but calm',
+    spdDesc: 'Moves 20% slower', strDesc: 'Stress rises 35% slower' },
+  { name: 'Wolf', color: '#b0b8c0', accent: '#7a8590',
+    speedMult: 1.0, stressMult: 1.0, trait: 'Balanced',
+    spdDesc: 'Normal speed', strDesc: 'Normal stress rate' },
 ];
 
 let player = { x: 0, y: 0 };
@@ -64,6 +69,19 @@ let timeBoosts = []; // { r, c, collected }
 const TIME_BOOST_AMOUNT = 5; // seconds added per pickup
 let timeBoostFlash = 0; // frames remaining for the +5s flash
 let isZoomedOut = false;
+
+// Player animation state
+let playerAnimFrame = 0;   // current walk frame (0, 1, 2)
+let playerAnimTimer = 0;   // frame counter for animation
+let playerFacing = 1;       // 1 = right, -1 = left
+const ANIM_SPEED = 10;     // frames between animation steps
+
+// Texture & decoration state
+let mazeTexture;    // pre-rendered createGraphics buffer
+let decorations = []; // { r, c, type: 'cobweb'|'moss'|'torch' }
+
+// Menu background image
+let menuBgImage;
 
 // p5.js fog buffer
 let fogBuffer;
@@ -218,6 +236,249 @@ function generateMaze() {
     );
     timeBoosts.push({ r: br, c: bc, collected: false });
   }
+
+  // Decorations (cobwebs, moss, torches)
+  decorations = [];
+  for (let r = 0; r < MAZE_ROWS; r++) {
+    for (let c = 0; c < MAZE_COLS; c++) {
+      const cell = maze[r][c];
+      const wallCount = (cell.top ? 1 : 0) + (cell.right ? 1 : 0) + (cell.bottom ? 1 : 0) + (cell.left ? 1 : 0);
+      // Cobwebs in dead ends
+      if (wallCount >= 3 && Math.random() < 0.4) {
+        decorations.push({ r, c, type: 'cobweb' });
+      }
+      // Moss on some cells
+      if (Math.random() < 0.08) {
+        decorations.push({ r, c, type: 'moss' });
+      }
+    }
+  }
+}
+
+// ============================================================
+// PROCEDURAL MAZE TEXTURE RENDERER
+// ============================================================
+function renderMazeTexture() {
+  if (mazeTexture) mazeTexture.remove();
+  mazeTexture = createGraphics(MAZE_WIDTH, MAZE_HEIGHT);
+  mazeTexture.noSmooth();
+
+  const g = mazeTexture;
+
+  // --- Step A: Draw stone brick floor for each cell ---
+  g.noStroke();
+  for (let r = 0; r < MAZE_ROWS; r++) {
+    for (let c = 0; c < MAZE_COLS; c++) {
+      const cx = c * CELL_SIZE;
+      const cy = r * CELL_SIZE;
+      drawFloorTile(g, cx, cy, r * MAZE_COLS + c);
+    }
+  }
+
+  // --- Step B: Draw wall segments ---
+  for (let r = 0; r < MAZE_ROWS; r++) {
+    for (let c = 0; c < MAZE_COLS; c++) {
+      const cell = maze[r][c];
+      const wx = c * CELL_SIZE;
+      const wy = r * CELL_SIZE;
+      const wt = WALL_THICKNESS;
+
+      if (cell.top) drawWallSegment(g, wx, wy - wt / 2, CELL_SIZE, wt, true, r * MAZE_COLS + c + 1000);
+      if (cell.bottom) drawWallSegment(g, wx, wy + CELL_SIZE - wt / 2, CELL_SIZE, wt, true, r * MAZE_COLS + c + 2000);
+      if (cell.left) drawWallSegment(g, wx - wt / 2, wy, wt, CELL_SIZE, false, r * MAZE_COLS + c + 3000);
+      if (cell.right) drawWallSegment(g, wx + CELL_SIZE - wt / 2, wy, wt, CELL_SIZE, false, r * MAZE_COLS + c + 4000);
+    }
+  }
+
+  // --- Step C: Draw static decorations ---
+  for (const dec of decorations) {
+    const dx = dec.c * CELL_SIZE;
+    const dy = dec.r * CELL_SIZE;
+
+    if (dec.type === 'cobweb') {
+      drawCobweb(g, dx, dy, maze[dec.r][dec.c]);
+    } else if (dec.type === 'moss') {
+      drawMoss(g, dx, dy, dec.r * MAZE_COLS + dec.c);
+    }
+    // torches are drawn as animated overlays in drawGameplay, not here
+  }
+}
+
+// --- Seeded random for consistent texture per cell ---
+function seededRandom(seed) {
+  let s = seed % 2147483647;
+  if (s <= 0) s += 2147483646;
+  s = (s * 16807) % 2147483647;
+  return (s - 1) / 2147483646;
+}
+
+// --- Draw a single stone brick floor tile ---
+function drawFloorTile(g, x, y, seed) {
+  const brickW = Math.floor((CELL_SIZE - MORTAR_WIDTH * 2) / 3);
+  const brickH = Math.floor((CELL_SIZE - MORTAR_WIDTH * 2) / 3);
+
+  // Fill cell with mortar color (dark)
+  g.noStroke();
+  g.fill(22, 20, 18);
+  g.rect(x, y, CELL_SIZE, CELL_SIZE);
+
+  // Draw bricks in a 3x3 grid with offset rows
+  for (let br = 0; br < 3; br++) {
+    const rowOffset = (br % 2 === 1) ? brickW / 2 : 0;
+    for (let bc = 0; bc < 3; bc++) {
+      const bx = x + MORTAR_WIDTH + bc * (brickW + MORTAR_WIDTH) + rowOffset;
+      const by = y + MORTAR_WIDTH + br * (brickH + MORTAR_WIDTH);
+
+      // Brick color with noise
+      const noiseSeed = seed * 9 + br * 3 + bc;
+      const variation = seededRandom(noiseSeed) * 16 - 8;
+      const baseGray = 42 + variation;
+      const greenTint = seededRandom(noiseSeed + 100) < 0.08;
+
+      if (greenTint) {
+        g.fill(baseGray - 5, baseGray + 8, baseGray - 3);
+      } else {
+        g.fill(baseGray, baseGray - 2, baseGray - 4);
+      }
+
+      // Clip bricks to cell bounds
+      const clippedW = Math.min(brickW, x + CELL_SIZE - bx);
+      const clippedH = Math.min(brickH, y + CELL_SIZE - by);
+      if (clippedW > 0 && clippedH > 0 && bx >= x) {
+        g.rect(bx, by, clippedW, clippedH);
+
+        // Subtle top-left highlight
+        g.fill(255, 255, 255, 12);
+        g.rect(bx, by, clippedW, 1);
+        g.rect(bx, by, 1, clippedH);
+
+        // Subtle bottom-right shadow
+        g.fill(0, 0, 0, 20);
+        g.rect(bx, by + clippedH - 1, clippedW, 1);
+        g.rect(bx + clippedW - 1, by, 1, clippedH);
+      }
+    }
+  }
+
+  // Occasional crack (3% chance)
+  if (seededRandom(seed + 500) < 0.03) {
+    g.stroke(15, 12, 10, 80);
+    g.strokeWeight(1);
+    const crackX = x + CELL_SIZE * 0.3 + seededRandom(seed + 501) * CELL_SIZE * 0.4;
+    const crackY = y + 4;
+    g.line(crackX, crackY, crackX + 6, crackY + CELL_SIZE * 0.6);
+    g.line(crackX + 6, crackY + CELL_SIZE * 0.6, crackX + 2, crackY + CELL_SIZE - 4);
+    g.noStroke();
+  }
+}
+
+// --- Draw a textured wall segment ---
+function drawWallSegment(g, x, y, w, h, isHorizontal, seed) {
+  // Base wall color (lighter stone)
+  g.noStroke();
+
+  if (isHorizontal) {
+    // Draw stone blocks along horizontal wall
+    const blockCount = Math.ceil(w / 12);
+    for (let i = 0; i < blockCount; i++) {
+      const bx = x + i * 12;
+      const bw = Math.min(12, x + w - bx);
+      const variation = seededRandom(seed + i * 7) * 18 - 9;
+      const base = 75 + variation;
+
+      g.fill(base, base - 3, base - 5);
+      g.rect(bx, y, bw, h);
+
+      // Top highlight
+      g.fill(255, 255, 255, 18);
+      g.rect(bx, y, bw, 1);
+
+      // Bottom shadow
+      g.fill(0, 0, 0, 35);
+      g.rect(bx, y + h - 1, bw, 1);
+
+      // Mortar gap between blocks
+      if (i > 0) {
+        g.fill(30, 25, 20, 150);
+        g.rect(bx, y, 1, h);
+      }
+    }
+  } else {
+    // Draw stone blocks along vertical wall
+    const blockCount = Math.ceil(h / 12);
+    for (let i = 0; i < blockCount; i++) {
+      const by = y + i * 12;
+      const bh = Math.min(12, y + h - by);
+      const variation = seededRandom(seed + i * 11) * 18 - 9;
+      const base = 75 + variation;
+
+      g.fill(base, base - 3, base - 5);
+      g.rect(x, by, w, bh);
+
+      // Left highlight
+      g.fill(255, 255, 255, 18);
+      g.rect(x, by, 1, bh);
+
+      // Right shadow
+      g.fill(0, 0, 0, 35);
+      g.rect(x + w - 1, by, 1, bh);
+
+      // Mortar gap between blocks
+      if (i > 0) {
+        g.fill(30, 25, 20, 150);
+        g.rect(x, by, w, 1);
+      }
+    }
+  }
+}
+
+// --- Draw cobweb decoration ---
+function drawCobweb(g, x, y, cell) {
+  // Find the corner with the most walls
+  let cornerX = x;
+  let cornerY = y;
+  if (!cell.top && cell.bottom) cornerY = y + CELL_SIZE;
+  if (!cell.left && cell.right) cornerX = x + CELL_SIZE;
+  if (cell.right && cell.bottom) { cornerX = x + CELL_SIZE; cornerY = y + CELL_SIZE; }
+  else if (cell.left && cell.bottom) { cornerX = x; cornerY = y + CELL_SIZE; }
+  else if (cell.right && cell.top) { cornerX = x + CELL_SIZE; cornerY = y; }
+
+  g.stroke(180, 180, 180, 40);
+  g.strokeWeight(1);
+  g.noFill();
+
+  const webSize = 14;
+  const dirX = cornerX > x + CELL_SIZE / 2 ? -1 : 1;
+  const dirY = cornerY > y + CELL_SIZE / 2 ? -1 : 1;
+
+  // Draw web strands
+  for (let i = 0; i < 4; i++) {
+    const spread = (i + 1) * 3.5;
+    g.line(cornerX, cornerY, cornerX + dirX * webSize, cornerY + dirY * spread);
+    g.line(cornerX, cornerY, cornerX + dirX * spread, cornerY + dirY * webSize);
+  }
+  // Cross strands
+  g.stroke(180, 180, 180, 25);
+  for (let ring = 1; ring <= 2; ring++) {
+    const offset = ring * 5;
+    g.arc(cornerX + dirX * offset, cornerY + dirY * offset, offset * 2, offset * 2,
+      dirX > 0 ? (dirY > 0 ? 0 : PI + HALF_PI) : (dirY > 0 ? HALF_PI : PI),
+      dirX > 0 ? (dirY > 0 ? HALF_PI : TWO_PI) : (dirY > 0 ? PI : PI + HALF_PI)
+    );
+  }
+  g.noStroke();
+}
+
+// --- Draw moss decoration ---
+function drawMoss(g, x, y, seed) {
+  g.noStroke();
+  for (let i = 0; i < 8; i++) {
+    const mx = x + seededRandom(seed + i * 3) * CELL_SIZE;
+    const my = y + CELL_SIZE * 0.6 + seededRandom(seed + i * 3 + 1) * CELL_SIZE * 0.35;
+    const ms = 2 + seededRandom(seed + i * 3 + 2) * 3;
+    g.fill(40, 65, 30, 60 + seededRandom(seed + i * 5) * 40);
+    g.rect(mx, my, ms, ms);
+  }
 }
 
 // ============================================================
@@ -260,6 +521,13 @@ function canMove(nx, ny) {
   if (cell.right && nx + halfSize > cellX + CELL_SIZE - margin) return false;
 
   return true;
+}
+
+// ============================================================
+// p5.js PRELOAD
+// ============================================================
+function preload() {
+  menuBgImage = loadImage('menu-bg.png');
 }
 
 // ============================================================
@@ -316,6 +584,15 @@ function keyPressed() {
     }
   }
 
+  // Escape key - return to menu from any screen
+  if (keyCode === ESCAPE) {
+    if (gameState === 'charSelect' || gameState === 'instructions') {
+      gameState = 'menu';
+    } else if (gameState === 'playing' || gameState === 'episode' || gameState === 'paused') {
+      gameState = 'menu';
+    }
+  }
+
   // Prevent default browser behavior for game keys
   return false;
 }
@@ -325,6 +602,7 @@ function keyPressed() {
 // ============================================================
 function startGame() {
   generateMaze();
+  renderMazeTexture();
   stress = 0;
   timer = GAME_TIME;
   episodeTimer = 0;
@@ -403,13 +681,28 @@ function updatePlaying() {
 
   if (isMoving) playStepSound();
 
+  // Update player animation
+  if (isMoving) {
+    playerAnimTimer++;
+    if (playerAnimTimer >= ANIM_SPEED) {
+      playerAnimTimer = 0;
+      playerAnimFrame = (playerAnimFrame + 1) % 3;
+    }
+    // Track facing direction based on horizontal input
+    if (dx > 0) playerFacing = 1;
+    else if (dx < 0) playerFacing = -1;
+  } else {
+    playerAnimFrame = 0;
+    playerAnimTimer = 0;
+  }
+
   // Zone detection
   const { r, c } = getPlayerCell();
   const inCalmZone = calmZones.some(cz => cz.r === r && cz.c === c);
   const inScaryZone = scaryZones.some(sz => sz.r === r && sz.c === c);
   const inNarrowZone = narrowZones.some(nz => nz.r === r && nz.c === c);
 
-  // Stress
+  // Stress (with character trait multiplier)
   if (gameState !== 'episode') {
     const stressMult = ch.stressMult;
     stress += STRESS_PASSIVE_RATE * dt * 60 * stressMult;
@@ -431,7 +724,7 @@ function updatePlaying() {
     if (stress >= 100) {
       gameState = 'episode';
       controlsInverted = true;
-      episodeDuration = EPISODE_DURATION_MIN + Math.random() * (EPISODE_DURATION_MAX - EPISODE_DURATION_MIN);
+      episodeDuration = 5;
       episodeTimer = episodeDuration;
       playEpisodeSound();
     }
@@ -440,8 +733,7 @@ function updatePlaying() {
     screenShake.x = (Math.random() - 0.5) * 12;
     screenShake.y = (Math.random() - 0.5) * 12;
 
-    const playerStopped = !isMoving;
-    if (episodeTimer <= 0 || (playerStopped && episodeTimer < episodeDuration - 1) || inCalmZone) {
+    if (episodeTimer <= 0) {
       gameState = 'playing';
       controlsInverted = false;
       stress = 60;
@@ -502,14 +794,30 @@ function draw() {
 function drawMenu() {
   background(10);
 
-  // Animated background particles
-  noStroke();
-  for (let i = 0; i < 30; i++) {
-    const px = (sin(frameCount * 0.01 + i * 1.5) * 0.5 + 0.5) * width;
-    const py = (cos(frameCount * 0.008 + i * 2.1) * 0.5 + 0.5) * height;
-    const a = (0.05 + sin(frameCount * 0.02 + i) * 0.03) * 255;
-    fill(100, 100, 120, a);
-    circle(px, py, 4 + sin(frameCount * 0.03 + i) * 2);
+  // Draw background image (cover the canvas)
+  if (menuBgImage) {
+    push();
+    imageMode(CENTER);
+    // Scale image to cover canvas while maintaining aspect ratio
+    const imgRatio = menuBgImage.width / menuBgImage.height;
+    const canvasRatio = width / height;
+    let drawW, drawH;
+    if (canvasRatio > imgRatio) {
+      drawW = width;
+      drawH = width / imgRatio;
+    } else {
+      drawH = height;
+      drawW = height * imgRatio;
+    }
+    tint(255, 180); // slightly dim so text is readable
+    image(menuBgImage, width / 2, height / 2, drawW, drawH);
+    noTint();
+    pop();
+
+    // Dark overlay for text readability
+    noStroke();
+    fill(0, 0, 0, 120);
+    rect(0, 0, width, height);
   }
 
   const cx = width / 2;
@@ -519,13 +827,13 @@ function drawMenu() {
   textAlign(CENTER, CENTER);
   textStyle(BOLD);
   textSize(64);
-  fill(224);
+  fill(255);
   text('LOST CONTROL', cx, cy - 120);
 
   // Subtitle
   textStyle(NORMAL);
   textSize(22);
-  fill(136);
+  fill(180);
   text('An Epilepsy Awareness Experience', cx, cy - 65);
 
   // Flicker
@@ -536,7 +844,7 @@ function drawMenu() {
 
   // Instructions
   textSize(20);
-  fill(170);
+  fill(200);
   text("You are on a journey but terrified of what's to come.", cx, cy + 10);
   text('Navigate the maze before time runs out.', cx, cy + 40);
   text('But beware... you might lose control.', cx, cy + 70);
@@ -553,7 +861,7 @@ function drawMenu() {
   // Controls hint
   textStyle(NORMAL);
   textSize(16);
-  fill(100);
+  fill(150);
   text('WASD / Arrow Keys = Move  |  Shift = Run  |  P = Pause  |  R = Restart', cx, height - 30);
 }
 
@@ -577,11 +885,15 @@ function drawCharSelect() {
   fill(136);
   text('Use LEFT / RIGHT arrow keys to select, ENTER to confirm', cx, cy - 85);
 
-  const spacing = 160;
+  textSize(14);
+  fill(100);
+  text('Press ESC to return to menu', cx, cy - 62);
+
+  const spacing = 180;
   const startX = cx - spacing;
   for (let i = 0; i < characters.length; i++) {
     const x = startX + i * spacing;
-    const y = cy + 10;
+    const y = cy + 15;
     const ch = characters[i];
     const selected = i === selectedChar;
 
@@ -590,48 +902,45 @@ function drawCharSelect() {
       noFill();
       stroke(255);
       strokeWeight(3);
-      rect(x - 55, y - 55, 110, 155);
+      rect(x - 70, y - 65, 140, 205);
 
       // Arrow indicators
       noStroke();
       fill(255);
       textStyle(BOLD);
       textSize(24);
-      text('>', x + 55, y + 5);
-      text('<', x - 55, y + 5);
+      text('>', x + 80, y + 5);
+      text('<', x - 80, y + 5);
     }
 
-    // Character body
-    noStroke();
-    fill(ch.color);
-    circle(x, y - 15, 44);
-
-    // Eyes
-    fill(255);
-    circle(x - 7, y - 20, 10);
-    circle(x + 7, y - 20, 10);
-    fill(17);
-    circle(x - 6, y - 19, 5);
-    circle(x + 8, y - 19, 5);
+    // Character pixel art (animated idle preview)
+    push();
+    translate(x, y - 15);
+    scale(1.8);
+    const previewFrame = floor(frameCount / 20) % 3;
+    if (i === 0) drawKnight(previewFrame);
+    else if (i === 1) drawMage(previewFrame);
+    else if (i === 2) drawWolf(previewFrame);
+    pop();
 
     // Name
+    textAlign(CENTER, CENTER);
     textStyle(selected ? BOLD : NORMAL);
     textSize(20);
     fill(selected ? 255 : 136);
-    text(ch.name, x, y + 48);
+    text(ch.name, x, y + 52);
 
     // Trait description
     textStyle(NORMAL);
     textSize(13);
     fill(selected ? 200 : 120);
-    text(ch.trait, x, y + 68);
+    text(ch.trait, x, y + 72);
 
-    // Stats
+    // Full stat descriptions (instead of abbreviations)
     textSize(11);
     fill(selected ? 170 : 100);
-    const spdLabel = ch.speedMult > 1 ? `+${Math.round((ch.speedMult - 1) * 100)}%` : ch.speedMult < 1 ? `${Math.round((ch.speedMult - 1) * 100)}%` : '0%';
-    const strLabel = ch.stressMult > 1 ? `+${Math.round((ch.stressMult - 1) * 100)}%` : ch.stressMult < 1 ? `${Math.round((ch.stressMult - 1) * 100)}%` : '0%';
-    text(`SPD:${spdLabel}  STR:${strLabel}`, x, y + 85);
+    text(ch.spdDesc, x, y + 90);
+    text(ch.strDesc, x, y + 105);
   }
 }
 
@@ -748,6 +1057,257 @@ function drawInstructions() {
 }
 
 // ============================================================
+// PIXEL ART CHARACTER DRAWING
+// ============================================================
+// Each function draws at origin (0,0). Characters are ~24px tall.
+// Uses 2-3px "pixel" blocks for retro feel.
+// frame: 0 = mid-stride left, 1 = legs together, 2 = mid-stride right
+
+function drawKnight(frame) {
+  const p = 2; // pixel size
+  noStroke();
+
+  // --- Helmet ---
+  // Helmet top (rounded steel)
+  fill(160, 170, 185); // light steel
+  rect(-3 * p, -12 * p, 6 * p, 2 * p); // top band
+  rect(-4 * p, -10 * p, 8 * p, 3 * p); // main helmet
+  // Visor slit (T-shape)
+  fill(30, 30, 40);
+  rect(-2 * p, -9 * p, 4 * p, p);       // horizontal slit
+  rect(-0.5 * p, -9 * p, p, 2 * p);     // vertical slit
+  // Helmet highlight
+  fill(200, 210, 225, 120);
+  rect(-3 * p, -12 * p, 2 * p, p);
+
+  // --- Body/Armor ---
+  fill(100, 110, 130); // chest armor
+  rect(-4 * p, -7 * p, 8 * p, 5 * p);
+  // Armor highlight
+  fill(140, 150, 170);
+  rect(-3 * p, -7 * p, 2 * p, p);
+  // Belt
+  fill(80, 70, 50);
+  rect(-4 * p, -2 * p, 8 * p, p);
+  fill(200, 180, 60); // belt buckle
+  rect(-p, -2 * p, 2 * p, p);
+
+  // --- Shield (left side) ---
+  fill(90, 100, 120);
+  rect(-6 * p, -7 * p, 2 * p, 5 * p);
+  // Shield emblem (gold cross)
+  fill(200, 180, 60);
+  rect(-5.5 * p, -5.5 * p, p, 2 * p);
+  rect(-6 * p, -5 * p, 2 * p, p);
+
+  // --- Weapon/torch (right side) ---
+  fill(110, 80, 50); // wooden handle
+  rect(4 * p, -8 * p, p, 5 * p);
+  // Torch flame
+  fill(255, 160, 40, 200);
+  rect(3.5 * p, -10 * p, 2 * p, 2 * p);
+  fill(255, 220, 80, 180);
+  rect(4 * p, -11 * p, p, p);
+
+  // --- Legs ---
+  fill(70, 75, 90); // dark armor legs
+  if (frame === 0) {
+    // Left leg forward, right back
+    rect(-3 * p, -p, 3 * p, 4 * p);
+    rect(1 * p, -p, 3 * p, 3 * p);
+  } else if (frame === 1) {
+    // Legs together
+    rect(-3 * p, -p, 3 * p, 4 * p);
+    rect(0, -p, 3 * p, 4 * p);
+  } else {
+    // Right leg forward, left back
+    rect(-3 * p, -p, 3 * p, 3 * p);
+    rect(1 * p, -p, 3 * p, 4 * p);
+  }
+
+  // --- Boots ---
+  fill(50, 45, 35);
+  if (frame === 0) {
+    rect(-3 * p, 3 * p, 3 * p, p);
+    rect(1 * p, 2 * p, 3 * p, p);
+  } else if (frame === 1) {
+    rect(-3 * p, 3 * p, 3 * p, p);
+    rect(0, 3 * p, 3 * p, p);
+  } else {
+    rect(-3 * p, 2 * p, 3 * p, p);
+    rect(1 * p, 3 * p, 3 * p, p);
+  }
+}
+
+function drawMage(frame) {
+  const p = 2; // pixel size
+  noStroke();
+
+  // --- Hood ---
+  // Hood point
+  fill(120, 90, 60); // brown cloak
+  rect(-p, -14 * p, 2 * p, 2 * p); // pointed tip
+  rect(-2 * p, -12 * p, 4 * p, 2 * p); // upper hood
+  rect(-3 * p, -10 * p, 6 * p, 3 * p); // lower hood
+
+  // Hood shadow/face
+  fill(30, 25, 20);
+  rect(-2 * p, -9 * p, 4 * p, 2 * p);
+  // Eyes (glowing under hood)
+  fill(180, 200, 150); // subtle greenish glow
+  rect(-1.5 * p, -8.5 * p, p, p);
+  rect(0.5 * p, -8.5 * p, p, p);
+
+  // --- Cloak body ---
+  fill(139, 107, 74); // warm brown
+  rect(-4 * p, -7 * p, 8 * p, 6 * p);
+  // Darker fold lines
+  fill(100, 75, 50);
+  rect(-p, -7 * p, p, 6 * p);
+  rect(2 * p, -6 * p, p, 5 * p);
+
+  // Cloak widens at bottom
+  fill(120, 90, 60);
+  rect(-5 * p, -p, 10 * p, 3 * p);
+
+  // Rope belt
+  fill(180, 160, 120);
+  rect(-3 * p, -3 * p, 6 * p, p);
+
+  // --- Staff (right side) ---
+  fill(90, 65, 40); // dark wood
+  rect(4 * p, -12 * p, p, 14 * p);
+  // Staff orb
+  fill(100, 180, 220, 200); // blue magical glow
+  rect(3.5 * p, -14 * p, 2 * p, 2 * p);
+  fill(180, 220, 255, 150);
+  rect(4 * p, -13.5 * p, p, p);
+
+  // --- Lower robe / feet ---
+  fill(100, 75, 50);
+  if (frame === 0) {
+    // Robe shifts slightly left
+    rect(-5 * p, 2 * p, 4 * p, 2 * p);
+    rect(0, 2 * p, 4 * p, p);
+  } else if (frame === 1) {
+    // Robe centered
+    rect(-5 * p, 2 * p, 10 * p, 2 * p);
+  } else {
+    // Robe shifts slightly right
+    rect(-4 * p, 2 * p, 4 * p, p);
+    rect(1 * p, 2 * p, 4 * p, 2 * p);
+  }
+
+  // Sandals peeking
+  fill(70, 55, 35);
+  if (frame === 0) {
+    rect(-4 * p, 4 * p, 2 * p, p);
+  } else if (frame === 1) {
+    rect(-3 * p, 4 * p, 2 * p, p);
+    rect(1 * p, 4 * p, 2 * p, p);
+  } else {
+    rect(2 * p, 4 * p, 2 * p, p);
+  }
+}
+
+function drawWolf(frame) {
+  const p = 2; // pixel size
+  noStroke();
+
+  // Wolf is horizontal (body runs left-right), centered on origin
+  // Drawn facing RIGHT by default
+
+  // --- Body ---
+  fill(176, 184, 192); // light gray
+  rect(-5 * p, -4 * p, 10 * p, 5 * p); // main body
+  // White belly
+  fill(220, 225, 230);
+  rect(-4 * p, -p, 8 * p, 2 * p);
+
+  // --- Head ---
+  fill(160, 170, 180); // slightly darker gray
+  rect(5 * p, -5 * p, 4 * p, 4 * p); // head block
+  // Snout
+  fill(176, 184, 192);
+  rect(9 * p, -4 * p, 2 * p, 2 * p);
+  // Nose
+  fill(30, 30, 30);
+  rect(10 * p, -4 * p, p, p);
+  // Eye
+  fill(200, 180, 50); // yellow wolf eye
+  rect(7 * p, -5 * p, p, p);
+  fill(20, 20, 20);
+  rect(7.5 * p, -5 * p, 0.5 * p, p); // pupil slit
+
+  // --- Ears ---
+  fill(140, 150, 160);
+  rect(6 * p, -7 * p, p, 2 * p); // left ear
+  rect(8 * p, -7 * p, p, 2 * p); // right ear
+  // Inner ear
+  fill(180, 140, 140);
+  rect(6 * p, -6.5 * p, p, p);
+  rect(8 * p, -6.5 * p, p, p);
+
+  // --- Tail ---
+  fill(150, 158, 168);
+  rect(-7 * p, -5 * p, 2 * p, p);
+  rect(-8 * p, -6 * p, 2 * p, p);
+  // Tail tip white
+  fill(220, 225, 230);
+  rect(-8 * p, -7 * p, p, p);
+
+  // --- Legs (4 legs, alternating pairs for walk) ---
+  fill(140, 148, 158);
+  if (frame === 0) {
+    // Front-left forward, front-right back; back-left back, back-right forward
+    rect(3 * p, p, 2 * p, 4 * p);   // front-left (forward)
+    rect(5 * p, p, 2 * p, 3 * p);   // front-right (back)
+    rect(-4 * p, p, 2 * p, 3 * p);  // back-left (back)
+    rect(-2 * p, p, 2 * p, 4 * p);  // back-right (forward)
+  } else if (frame === 1) {
+    // All legs even
+    rect(3 * p, p, 2 * p, 3 * p);
+    rect(5 * p, p, 2 * p, 3 * p);
+    rect(-4 * p, p, 2 * p, 3 * p);
+    rect(-2 * p, p, 2 * p, 3 * p);
+  } else {
+    // Opposite of frame 0
+    rect(3 * p, p, 2 * p, 3 * p);   // front-left (back)
+    rect(5 * p, p, 2 * p, 4 * p);   // front-right (forward)
+    rect(-4 * p, p, 2 * p, 4 * p);  // back-left (forward)
+    rect(-2 * p, p, 2 * p, 3 * p);  // back-right (back)
+  }
+
+  // --- Paws ---
+  fill(100, 108, 118);
+  if (frame === 0) {
+    rect(3 * p, 5 * p, 2 * p, p);
+    rect(-2 * p, 5 * p, 2 * p, p);
+  } else if (frame === 1) {
+    rect(3 * p, 4 * p, 2 * p, p);
+    rect(5 * p, 4 * p, 2 * p, p);
+    rect(-4 * p, 4 * p, 2 * p, p);
+    rect(-2 * p, 4 * p, 2 * p, p);
+  } else {
+    rect(5 * p, 5 * p, 2 * p, p);
+    rect(-4 * p, 5 * p, 2 * p, p);
+  }
+}
+
+// --- drawPlayer: dispatches to correct character pixel art ---
+function drawPlayer() {
+  push();
+  translate(player.x, player.y);
+  scale(playerFacing, 1); // flip for direction
+
+  if (selectedChar === 0) drawKnight(playerAnimFrame);
+  else if (selectedChar === 1) drawMage(playerAnimFrame);
+  else if (selectedChar === 2) drawWolf(playerAnimFrame);
+
+  pop();
+}
+
+// ============================================================
 // GAMEPLAY DRAWING
 // ============================================================
 function drawGameplay() {
@@ -780,12 +1340,18 @@ function drawGameplay() {
 
   translate(-camX, -camY);
 
-  // --- Maze background ---
+  // --- Pre-rendered maze texture (floor + walls + decorations) ---
   const darken = stress / 100;
-  const baseBg = Math.floor(70 - darken * 30);
-  noStroke();
-  fill(baseBg, baseBg, baseBg + 8);
-  rect(0, 0, MAZE_WIDTH, MAZE_HEIGHT);
+  if (mazeTexture) {
+    if (gameState === 'episode') {
+      tint(200, 150, 150);
+    } else {
+      tint(255 - darken * 60);
+    }
+    image(mazeTexture, 0, 0);
+    noTint();
+  }
+
 
   // --- Calm zones ---
   for (const cz of calmZones) {
@@ -858,41 +1424,8 @@ function drawGameplay() {
   strokeWeight(2);
   rect(egx + 2, egy + 2, CELL_SIZE - 4, CELL_SIZE - 4);
 
-  // --- Walls ---
-  if (gameState === 'episode') {
-    stroke(150 + random(50), 50 + random(30), 50 + random(30), 230);
-  } else {
-    const wc = 180 - darken * 40;
-    stroke(wc, wc, wc + 10);
-  }
-  strokeWeight(3);
-
-  for (let r = 0; r < MAZE_ROWS; r++) {
-    for (let c = 0; c < MAZE_COLS; c++) {
-      const x = c * CELL_SIZE;
-      const y = r * CELL_SIZE;
-      const cell = maze[r][c];
-
-      if (cell.top) line(x, y, x + CELL_SIZE, y);
-      if (cell.right) line(x + CELL_SIZE, y, x + CELL_SIZE, y + CELL_SIZE);
-      if (cell.bottom) line(x, y + CELL_SIZE, x + CELL_SIZE, y + CELL_SIZE);
-      if (cell.left) line(x, y, x, y + CELL_SIZE);
-    }
-  }
-
-  // --- Player ---
-  const ch = characters[selectedChar];
-  noStroke();
-  fill(ch.color);
-  circle(player.x, player.y, PLAYER_SIZE);
-
-  // Player eyes
-  fill(255);
-  circle(player.x - 4, player.y - 3, 6);
-  circle(player.x + 4, player.y - 3, 6);
-  fill(17);
-  circle(player.x - 4, player.y - 3, 3);
-  circle(player.x + 4, player.y - 3, 3);
+  // --- Player (pixel art) ---
+  drawPlayer();
 
   // --- Direction arrow to exit ---
   drawDirectionArrow();
@@ -1137,10 +1670,10 @@ function drawHUD() {
 
   // --- Controls reminder ---
   textAlign(LEFT, CENTER);
-  textStyle(NORMAL);
+  textStyle(BOLD);
   textSize(14);
-  fill(150, 150, 150, 150);
-  text('P = Pause | R = Restart | Shift = Run | Z = Zoom Out', padding, padding + 12);
+  fill(255);
+  text('P = Pause | R = Restart | Shift = Run | Z = Zoom Out | ESC = Menu', padding, padding + 12);
 }
 
 // ============================================================
